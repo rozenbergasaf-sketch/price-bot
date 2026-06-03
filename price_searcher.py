@@ -4,6 +4,7 @@ import re
 import json
 import logging
 import os
+import base64
 from urllib.parse import urlparse, quote_plus
 
 logger = logging.getLogger(__name__)
@@ -22,57 +23,138 @@ class PriceSearcher:
     def __init__(self):
         self.timeout = aiohttp.ClientTimeout(total=30)
 
-    async def search_prices(self, url: str) -> dict:
+    async def search_prices(self, product_name: str = None, image_bytes: bytes = None, image_mime: str = None) -> dict:
         try:
-            product_info = await self._extract_product_info(url)
-            if not product_info["success"]:
-                return product_info
+            # If given a URL as product_name, extract name + image from the page
+            if product_name and product_name.startswith("http"):
+                page_info = await self._extract_from_url(product_name)
+                if not page_info["success"]:
+                    return page_info
+                product_name = page_info["name"]
+                # Use page image if no image was passed in
+                if not image_bytes and page_info.get("image_bytes"):
+                    image_bytes = page_info["image_bytes"]
+                    image_mime = page_info.get("image_mime", "image/jpeg")
 
-            product_name = product_info["name"]
-            logger.info(f"Searching prices for: {product_name}")
+            if not product_name and not image_bytes:
+                return {"success": False, "error": "לא סופק מוצר לחיפוש"}
 
-            prices = await self._search_aliexpress_via_claude(product_name)
+            prices = await self._search_aliexpress_via_claude(
+                product_name=product_name,
+                image_bytes=image_bytes,
+                image_mime=image_mime
+            )
             prices = self._sort_by_price(prices)
 
             return {
                 "success": True,
-                "product_name": product_name,
+                "product_name": product_name or "מוצר מהתמונה",
                 "prices": prices
             }
         except Exception as e:
             logger.error(f"search_prices error: {e}")
             return {"success": False, "error": f"שגיאה בחיפוש: {str(e)}"}
 
-    async def _extract_product_info(self, url: str) -> dict:
+    # ------------------------------------------------------------------ #
+    #  Extract product name + main image from any product page URL        #
+    # ------------------------------------------------------------------ #
+    async def _extract_from_url(self, url: str) -> dict:
         try:
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
                 async with session.get(url, allow_redirects=True) as response:
                     if response.status != 200:
                         name = self._extract_name_from_url(url)
                         if name:
-                            return {"success": True, "name": name}
+                            return {"success": True, "name": name, "image_bytes": None}
                         return {"success": False, "error": f"לא ניתן לגשת לדף (קוד {response.status})"}
                     html = await response.text()
+                    final_url = str(response.url)
 
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, "html.parser")
-            name = self._extract_name_from_soup(soup, url)
-            if not name:
-                name = self._extract_name_from_url(url)
+
+            name = self._extract_name_from_soup(soup, final_url) or self._extract_name_from_url(url)
             if not name:
                 return {"success": False, "error": "לא הצלחתי לחלץ את שם המוצר"}
-            return {"success": True, "name": name}
+
+            # Extract main product image URL
+            image_url = self._extract_image_url(soup, final_url)
+            image_bytes = None
+            image_mime = "image/jpeg"
+
+            if image_url:
+                try:
+                    async with aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as session:
+                        async with session.get(image_url) as img_resp:
+                            if img_resp.status == 200:
+                                image_bytes = await img_resp.read()
+                                ct = img_resp.headers.get("Content-Type", "image/jpeg")
+                                image_mime = ct.split(";")[0].strip()
+                                # Limit to 4MB
+                                if len(image_bytes) > 4 * 1024 * 1024:
+                                    image_bytes = None
+                except Exception as e:
+                    logger.warning(f"Could not download product image: {e}")
+
+            return {"success": True, "name": name, "image_bytes": image_bytes, "image_mime": image_mime}
+
         except asyncio.TimeoutError:
             name = self._extract_name_from_url(url)
             if name:
-                return {"success": True, "name": name}
+                return {"success": True, "name": name, "image_bytes": None}
             return {"success": False, "error": "הדף לקח יותר מדי זמן לטעון"}
         except Exception as e:
-            logger.error(f"_extract_product_info error: {e}")
+            logger.error(f"_extract_from_url error: {e}")
             name = self._extract_name_from_url(url)
             if name:
-                return {"success": True, "name": name}
+                return {"success": True, "name": name, "image_bytes": None}
             return {"success": False, "error": "לא ניתן לגשת לדף. בדוק שהלינק תקין."}
+
+    def _extract_image_url(self, soup, url: str) -> str:
+        """Extract the main product image URL from the page."""
+        domain = urlparse(url).netloc.lower()
+
+        # Site-specific selectors
+        site_selectors = {
+            "amazon":      ["#landingImage", "#imgBlkFront", "#main-image"],
+            "ebay":        [".ux-image-carousel-item img", "#icImg"],
+            "aliexpress":  [".product-image img", ".images-view-item img", "[class*='product-image'] img"],
+            "walmart":     ["[data-testid='hero-image'] img", ".prod-hero-image img"],
+        }
+        for site_key, selectors in site_selectors.items():
+            if site_key in domain:
+                for sel in selectors:
+                    el = soup.select_one(sel)
+                    if el:
+                        src = el.get("src") or el.get("data-src") or el.get("data-old-hires") or el.get("data-a-dynamic-image")
+                        if src and src.startswith("http"):
+                            return src
+
+        # OpenGraph image (works on most sites)
+        og = soup.find("meta", property="og:image")
+        if og and og.get("content"):
+            return og["content"]
+
+        # JSON-LD image
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                if isinstance(data, dict):
+                    img = data.get("image")
+                    if isinstance(img, str) and img.startswith("http"):
+                        return img
+                    if isinstance(img, list) and img:
+                        return img[0] if isinstance(img[0], str) else img[0].get("url", "")
+            except Exception:
+                pass
+
+        # First large img on page
+        for img in soup.find_all("img"):
+            src = img.get("src", "")
+            if src.startswith("http") and any(x in src for x in ["product", "item", "main", "primary", "large"]):
+                return src
+
+        return ""
 
     def _extract_name_from_url(self, url: str) -> str:
         try:
@@ -89,14 +171,12 @@ class PriceSearcher:
 
     def _extract_name_from_soup(self, soup, url: str) -> str:
         domain = urlparse(url).netloc.lower()
-
         site_selectors = {
-            "amazon": ["#productTitle", "span#productTitle"],
-            "ebay": ["h1.x-item-title__mainTitle", "h1[itemprop='name']"],
+            "amazon":     ["#productTitle", "span#productTitle"],
+            "ebay":       ["h1.x-item-title__mainTitle", "h1[itemprop='name']"],
             "aliexpress": [".product-title", "h1.product-title-text", "[class*='title--wrap']", "h1"],
-            "walmart": ["h1[itemprop='name']", ".prod-ProductTitle"],
+            "walmart":    ["h1[itemprop='name']", ".prod-ProductTitle"],
         }
-
         for site_key, selectors in site_selectors.items():
             if site_key in domain:
                 for sel in selectors:
@@ -106,7 +186,7 @@ class PriceSearcher:
 
         og = soup.find("meta", property="og:title")
         if og and og.get("content") and len(og["content"].strip()) > 5:
-            return self._clean_product_name(og["content"].strip())
+            return self._clean_name(og["content"].strip())
 
         for script in soup.find_all("script", type="application/ld+json"):
             try:
@@ -130,13 +210,12 @@ class PriceSearcher:
         if h1 and len(h1.get_text(strip=True)) > 5:
             return h1.get_text(strip=True)[:200]
 
-        title_tag = soup.find("title")
-        if title_tag:
-            return self._clean_product_name(title_tag.get_text(strip=True))
-
+        title = soup.find("title")
+        if title:
+            return self._clean_name(title.get_text(strip=True))
         return ""
 
-    def _clean_product_name(self, name: str) -> str:
+    def _clean_name(self, name: str) -> str:
         patterns = [
             r"\s*[\|\-–]\s*(Amazon|eBay|AliExpress|Walmart|Target|Etsy).*$",
             r"\s*[\|\-–]\s*[A-Z][a-zA-Z\s]*\.com.*$",
@@ -145,32 +224,63 @@ class PriceSearcher:
             name = re.sub(p, "", name, flags=re.IGNORECASE)
         return name.strip()[:200]
 
-    async def _search_aliexpress_via_claude(self, product_name: str) -> list:
-        """Use Claude with web_search to find AliExpress prices."""
+    # ------------------------------------------------------------------ #
+    #  Claude search — sends both name + image for best results           #
+    # ------------------------------------------------------------------ #
+    async def _search_aliexpress_via_claude(self, product_name: str = None, image_bytes: bytes = None, image_mime: str = None) -> list:
         if not ANTHROPIC_API_KEY:
-            logger.warning("No ANTHROPIC_API_KEY set")
-            return self._fallback_links(product_name)
+            return self._fallback_links(product_name or "מוצר")
+
+        # Build the user message content
+        content = []
+
+        # Add image if available
+        if image_bytes:
+            mime = image_mime or "image/jpeg"
+            if mime not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+                mime = "image/jpeg"
+            b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": mime, "data": b64}
+            })
+
+        # Build text prompt
+        if product_name and image_bytes:
+            search_instruction = (
+                f"Product name: {product_name}\n"
+                "I'm also attaching the product image above.\n\n"
+                "Use BOTH the product name AND the image to search AliExpress for this exact product or the closest match."
+            )
+        elif image_bytes:
+            search_instruction = (
+                "Look at the product in this image.\n"
+                "Identify what this product is, then search AliExpress for it."
+            )
+        else:
+            search_instruction = f"Search AliExpress for: {product_name}"
 
         prompt = (
-            f"Search AliExpress for: {product_name}\n\n"
-            "Find the 5 cheapest listings on AliExpress for this product right now.\n"
-            "Return ONLY a JSON array with exactly this format, no other text:\n"
-            '[\n'
+            f"{search_instruction}\n\n"
+            "Find the 5 cheapest listings on AliExpress right now.\n"
+            "Return ONLY a JSON array, no other text:\n"
+            "[\n"
             '  {"title": "short product title", "price": "$X.XX", "url": "https://www.aliexpress.com/item/..."}\n'
-            ']\n\n'
+            "]\n\n"
             "Rules:\n"
-            "- Only AliExpress URLs\n"
+            "- Only real AliExpress URLs (aliexpress.com/item/...)\n"
             "- Real prices with currency symbol\n"
-            "- Sort from cheapest to most expensive\n"
-            "- Return maximum 5 items\n"
-            "- If you cannot find real results, return empty array []"
+            "- Sort cheapest first\n"
+            "- Maximum 5 items\n"
+            "- If no results found, return []"
         )
+        content.append({"type": "text", "text": prompt})
 
         payload = {
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 1000,
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-            "messages": [{"role": "user", "content": prompt}]
+            "messages": [{"role": "user", "content": content}]
         }
 
         headers = {
@@ -187,41 +297,36 @@ class PriceSearcher:
                     headers=headers
                 ) as response:
                     if response.status != 200:
-                        logger.error(f"Anthropic API error: {response.status}")
-                        return self._fallback_links(product_name)
+                        logger.error(f"Anthropic API error: {response.status} — {await response.text()}")
+                        return self._fallback_links(product_name or "מוצר")
                     data = await response.json()
 
-            # Extract text from response
-            full_text = ""
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    full_text += block.get("text", "")
+            full_text = "".join(
+                block.get("text", "") for block in data.get("content", [])
+                if block.get("type") == "text"
+            )
 
-            # Parse JSON from response
             json_match = re.search(r'\[.*?\]', full_text, re.DOTALL)
             if not json_match:
-                logger.warning("No JSON array found in Claude response")
-                return self._fallback_links(product_name)
+                logger.warning("No JSON in Claude response")
+                return self._fallback_links(product_name or "מוצר")
 
             items = json.loads(json_match.group())
-            results = []
-            for item in items[:5]:
-                if item.get("price") and item.get("url"):
-                    results.append({
-                        "store": "AliExpress",
-                        "price": item["price"],
-                        "link": item["url"],
-                        "title": item.get("title", "")[:80],
-                    })
-
-            if not results:
-                return self._fallback_links(product_name)
-
-            return results
+            results = [
+                {
+                    "store": "AliExpress",
+                    "price": item["price"],
+                    "link": item["url"],
+                    "title": item.get("title", "")[:80],
+                }
+                for item in items[:5]
+                if item.get("price") and item.get("url")
+            ]
+            return results if results else self._fallback_links(product_name or "מוצר")
 
         except Exception as e:
             logger.error(f"Claude search error: {e}")
-            return self._fallback_links(product_name)
+            return self._fallback_links(product_name or "מוצר")
 
     def _fallback_links(self, product_name: str) -> list:
         query = quote_plus(product_name)
@@ -233,9 +338,9 @@ class PriceSearcher:
         }]
 
     def _sort_by_price(self, prices: list) -> list:
-        def extract_number(price_str: str) -> float:
-            if not price_str or not re.search(r'\d', price_str):
+        def to_num(p: str) -> float:
+            if not p or not re.search(r'\d', p):
                 return float("inf")
-            nums = re.findall(r'[\d]+\.?\d*', price_str.replace(",", ""))
+            nums = re.findall(r'[\d]+\.?\d*', p.replace(",", ""))
             return float(nums[0]) if nums else float("inf")
-        return sorted(prices, key=lambda x: extract_number(x.get("price", "")))
+        return sorted(prices, key=lambda x: to_num(x.get("price", "")))
