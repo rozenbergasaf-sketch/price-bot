@@ -13,15 +13,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-
 searcher = PriceSearcher()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 שלום! אני בוט חיפוש מחירים.\n\n"
-        "📦 שלח לי *לינק למוצר* מכל אתר קניות (Amazon, eBay, AliExpress, Zara, כלשהו)\n"
-        "ואני אחפש לך היכן ניתן למצוא אותו *הכי זול*! 🔍\n\n"
+        "👋 שלום! אני בוט חיפוש מחירים ב-AliExpress.\n\n"
+        "📦 שלח לי *לינק למוצר* מכל אתר\n"
+        "ואני אמצא לך את *5 המחירים הכי זולים* ב-AliExpress! 🔍\n\n"
         "פשוט הדבק את הלינק בצ'אט ✨",
         parse_mode="Markdown"
     )
@@ -33,99 +32,86 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1️⃣ מצא מוצר שאתה רוצה לקנות\n"
         "2️⃣ העתק את הלינק שלו\n"
         "3️⃣ הדבק אותו כאן\n"
-        "4️⃣ קבל השוואת מחירים!\n\n"
-        "*אתרים נתמכים:*\n"
-        "• Amazon 🛒\n"
-        "• eBay 🏷️\n"
-        "• AliExpress 📦\n"
-        "• כל לינק מוצר אחר!\n\n"
-        "_הבוט יחלץ את שם המוצר ויחפש מחירים בגוגל שופינג_",
+        "4️⃣ קבל 5 תוצאות מ-AliExpress מהזול לביקר!\n\n"
+        "_הבוט מחלץ את שם המוצר ומחפש עבורך ב-AliExpress_",
         parse_mode="Markdown"
     )
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    
-    # Extract URL from message
+
     url_pattern = r'https?://[^\s]+'
     urls = re.findall(url_pattern, text)
-    
+
     if not urls:
         await update.message.reply_text(
             "❌ לא מצאתי לינק בהודעה.\nאנא שלח לינק מלא (מתחיל ב-http:// או https://)"
         )
         return
-    
+
     url = urls[0]
-    
-    # Send loading message
+
     loading_msg = await update.message.reply_text(
-        "🔍 מחפש מחירים... רגע אחד!\n"
-        "⏳ _מנתח את המוצר ומחפש בכל האינטרנט..._",
+        "🔍 מחפש ב-AliExpress... רגע אחד!\n"
+        "⏳ _מנתח את המוצר..._",
         parse_mode="Markdown"
     )
-    
+
     try:
         result = await searcher.search_prices(url)
-        
+
         if not result["success"]:
             await loading_msg.edit_text(
-                f"⚠️ {result['error']}\n\n"
-                "נסה לינק אחר או בדוק שהלינק תקין."
+                f"⚠️ {result['error']}\n\nנסה לינק אחר או בדוק שהלינק תקין."
             )
             return
-        
-        # Format response
+
         product_name = result.get("product_name", "המוצר שלך")
         prices = result.get("prices", [])
-        
-        response = f"🛍️ *{product_name}*\n\n"
-        response += "💰 *תוצאות חיפוש מחיר:*\n\n"
-        
-        if prices:
-            for i, item in enumerate(prices[:8], 1):
-                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-                name = item.get("store", "חנות לא ידועה")
-                price = item.get("price", "מחיר לא זמין")
+
+        response = f"🛍️ *{product_name[:100]}*\n\n"
+
+        if prices and prices[0].get("price") != "לחץ לחיפוש":
+            response += "💰 *5 המחירים הזולים ביותר ב-AliExpress:*\n\n"
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+            for i, item in enumerate(prices[:5]):
+                medal = medals[i] if i < len(medals) else f"{i+1}."
+                price = item.get("price", "?")
                 link = item.get("link", "")
-                
+                title = item.get("title", "")
+
                 if link:
-                    response += f"{emoji} *{name}*\n   💵 {price}\n   🔗 [לחץ לרכישה]({link})\n\n"
+                    response += f"{medal} *{price}*"
+                    if title:
+                        response += f"\n    _{title[:60]}_"
+                    response += f"\n    🔗 [לרכישה]({link})\n\n"
                 else:
-                    response += f"{emoji} *{name}*\n   💵 {price}\n\n"
-            
-            # Add cheapest highlight
-            if prices[0].get("price"):
-                response += f"✅ *הכי זול:* {prices[0].get('store')} - {prices[0].get('price')}"
+                    response += f"{medal} *{price}*\n\n"
+
+            cheapest = prices[0].get("price", "")
+            if cheapest:
+                response += f"✅ *הכי זול:* {cheapest}"
         else:
-            response += "😕 לא נמצאו תוצאות מחיר.\nנסה לחפש ישירות ב-Google Shopping."
-        
-        # Add Google Shopping search button
-        search_query = product_name.replace(" ", "+")
-        google_shopping_url = f"https://www.google.com/search?tbm=shop&q={search_query}"
-        pricespy_url = f"https://www.pricespy.co.uk/search?search={search_query}"
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("🛒 Google Shopping", url=google_shopping_url),
-                InlineKeyboardButton("📊 PriceSpy", url=pricespy_url),
-            ],
-        ]
+            response += "😕 לא נמצאו תוצאות מחיר.\nלחץ על הכפתור כדי לחפש ידנית:"
+
+        query = product_name.replace(" ", "+")
+        ali_url = f"https://www.aliexpress.com/wholesale?SearchText={query}&SortType=total_tranpro_desc"
+
+        keyboard = [[InlineKeyboardButton("🛒 חפש ב-AliExpress", url=ali_url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await loading_msg.edit_text(
             response,
             parse_mode="Markdown",
             reply_markup=reply_markup,
             disable_web_page_preview=True
         )
-        
+
     except Exception as e:
         logger.error(f"Error processing URL: {e}")
         await loading_msg.edit_text(
-            "❌ אירעה שגיאה בחיפוש.\n"
-            "נסה שוב מאוחר יותר או שלח לינק אחר."
+            "❌ אירעה שגיאה בחיפוש.\nנסה שוב מאוחר יותר או שלח לינק אחר."
         )
 
 
@@ -135,7 +121,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_url(update, context)
     else:
         await update.message.reply_text(
-            "שלח לי לינק למוצר ואני אחפש את המחיר הכי זול! 🛍️\n"
+            "שלח לי לינק למוצר ואני אמצא את המחירים הכי זולים ב-AliExpress! 🛍️\n"
             "לעזרה הקלד /help"
         )
 
@@ -143,16 +129,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("❌ ERROR: Set TELEGRAM_BOT_TOKEN environment variable!")
-        print("Get a token from @BotFather on Telegram")
         return
-    
+
     app = Application.builder().token(BOT_TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("🤖 Bot is running! Press Ctrl+C to stop.")
+
+    print("🤖 Bot is running!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
