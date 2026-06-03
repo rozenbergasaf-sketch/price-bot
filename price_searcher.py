@@ -15,12 +15,12 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-SERP_API_KEY = os.environ.get("SERPAPI_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 
 class PriceSearcher:
     def __init__(self):
-        self.timeout = aiohttp.ClientTimeout(total=25)
+        self.timeout = aiohttp.ClientTimeout(total=30)
 
     async def search_prices(self, url: str) -> dict:
         try:
@@ -31,11 +31,7 @@ class PriceSearcher:
             product_name = product_info["name"]
             logger.info(f"Searching prices for: {product_name}")
 
-            if SERP_API_KEY:
-                prices = await self._search_via_serpapi(product_name)
-            else:
-                prices = await self._search_fallback(product_name)
-
+            prices = await self._search_aliexpress_via_claude(product_name)
             prices = self._sort_by_price(prices)
 
             return {
@@ -52,7 +48,6 @@ class PriceSearcher:
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
                 async with session.get(url, allow_redirects=True) as response:
                     if response.status != 200:
-                        # Try to extract product name from URL itself as fallback
                         name = self._extract_name_from_url(url)
                         if name:
                             return {"success": True, "name": name}
@@ -65,7 +60,7 @@ class PriceSearcher:
             if not name:
                 name = self._extract_name_from_url(url)
             if not name:
-                return {"success": False, "error": "לא הצלחתי לחלץ את שם המוצר מהדף"}
+                return {"success": False, "error": "לא הצלחתי לחלץ את שם המוצר"}
             return {"success": True, "name": name}
         except asyncio.TimeoutError:
             name = self._extract_name_from_url(url)
@@ -80,12 +75,8 @@ class PriceSearcher:
             return {"success": False, "error": "לא ניתן לגשת לדף. בדוק שהלינק תקין."}
 
     def _extract_name_from_url(self, url: str) -> str:
-        """Try to get a product name from the URL path itself."""
         try:
             path = urlparse(url).path
-            # AliExpress: /item/1005009865727415.html -> not useful
-            # Amazon: /dp/B08XYZ/ref=... -> not useful
-            # But some URLs have product names in them
             segments = [s for s in path.split("/") if len(s) > 10 and not s.isdigit()]
             if segments:
                 name = segments[-1].replace("-", " ").replace("_", " ")
@@ -102,15 +93,8 @@ class PriceSearcher:
         site_selectors = {
             "amazon": ["#productTitle", "span#productTitle"],
             "ebay": ["h1.x-item-title__mainTitle", "h1[itemprop='name']"],
-            "aliexpress": [
-                ".product-title",
-                "h1.product-title-text",
-                "[class*='title--wrap']",
-                "[class*='ProductTitle']",
-                "h1"
-            ],
+            "aliexpress": [".product-title", "h1.product-title-text", "[class*='title--wrap']", "h1"],
             "walmart": ["h1[itemprop='name']", ".prod-ProductTitle"],
-            "etsy": ["h1[data-buy-box-listing-title]", ".wt-text-body-03"],
         }
 
         for site_key, selectors in site_selectors.items():
@@ -154,77 +138,99 @@ class PriceSearcher:
 
     def _clean_product_name(self, name: str) -> str:
         patterns = [
-            r"\s*[\|\-–]\s*(Amazon|eBay|AliExpress|Walmart|Target|Etsy|Buy|Shop).*$",
+            r"\s*[\|\-–]\s*(Amazon|eBay|AliExpress|Walmart|Target|Etsy).*$",
             r"\s*[\|\-–]\s*[A-Z][a-zA-Z\s]*\.com.*$",
         ]
         for p in patterns:
             name = re.sub(p, "", name, flags=re.IGNORECASE)
         return name.strip()[:200]
 
-    async def _search_via_serpapi(self, product_name: str) -> list:
-        """Use SerpAPI to search Google Shopping — reliable, not blocked."""
-        query = quote_plus(product_name)
-        url = (
-            f"https://serpapi.com/search.json"
-            f"?engine=google_shopping"
-            f"&q={query}"
-            f"&api_key={SERP_API_KEY}"
-            f"&hl=en&gl=us&num=10"
+    async def _search_aliexpress_via_claude(self, product_name: str) -> list:
+        """Use Claude with web_search to find AliExpress prices."""
+        if not ANTHROPIC_API_KEY:
+            logger.warning("No ANTHROPIC_API_KEY set")
+            return self._fallback_links(product_name)
+
+        prompt = (
+            f"Search AliExpress for: {product_name}\n\n"
+            "Find the 5 cheapest listings on AliExpress for this product right now.\n"
+            "Return ONLY a JSON array with exactly this format, no other text:\n"
+            '[\n'
+            '  {"title": "short product title", "price": "$X.XX", "url": "https://www.aliexpress.com/item/..."}\n'
+            ']\n\n'
+            "Rules:\n"
+            "- Only AliExpress URLs\n"
+            "- Real prices with currency symbol\n"
+            "- Sort from cheapest to most expensive\n"
+            "- Return maximum 5 items\n"
+            "- If you cannot find real results, return empty array []"
         )
-        results = []
+
+        payload = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1000,
+            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+            "messages": [{"role": "user", "content": prompt}]
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        }
+
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.get(url) as response:
+                async with session.post(
+                    "https://api.anthropic.com/v1/messages",
+                    json=payload,
+                    headers=headers
+                ) as response:
                     if response.status != 200:
-                        logger.warning(f"SerpAPI returned {response.status}")
-                        return await self._search_fallback(product_name)
+                        logger.error(f"Anthropic API error: {response.status}")
+                        return self._fallback_links(product_name)
                     data = await response.json()
 
-            shopping_results = data.get("shopping_results", [])
-            for item in shopping_results[:8]:
-                results.append({
-                    "store": item.get("source", "חנות"),
-                    "price": item.get("price", ""),
-                    "link": item.get("link", ""),
-                    "title": item.get("title", "")[:80],
-                })
+            # Extract text from response
+            full_text = ""
+            for block in data.get("content", []):
+                if block.get("type") == "text":
+                    full_text += block.get("text", "")
+
+            # Parse JSON from response
+            json_match = re.search(r'\[.*?\]', full_text, re.DOTALL)
+            if not json_match:
+                logger.warning("No JSON array found in Claude response")
+                return self._fallback_links(product_name)
+
+            items = json.loads(json_match.group())
+            results = []
+            for item in items[:5]:
+                if item.get("price") and item.get("url"):
+                    results.append({
+                        "store": "AliExpress",
+                        "price": item["price"],
+                        "link": item["url"],
+                        "title": item.get("title", "")[:80],
+                    })
+
+            if not results:
+                return self._fallback_links(product_name)
+
+            return results
 
         except Exception as e:
-            logger.error(f"SerpAPI error: {e}")
-            return await self._search_fallback(product_name)
+            logger.error(f"Claude search error: {e}")
+            return self._fallback_links(product_name)
 
-        return results
-
-    async def _search_fallback(self, product_name: str) -> list:
-        """Fallback when no API key: return search links for the user to check manually."""
+    def _fallback_links(self, product_name: str) -> list:
         query = quote_plus(product_name)
-        # Return helpful search links instead of empty results
-        return [
-            {
-                "store": "Google Shopping",
-                "price": "לחץ לחיפוש",
-                "link": f"https://www.google.com/search?tbm=shop&q={query}",
-                "title": product_name[:60]
-            },
-            {
-                "store": "AliExpress",
-                "price": "לחץ לחיפוש",
-                "link": f"https://www.aliexpress.com/wholesale?SearchText={query}",
-                "title": product_name[:60]
-            },
-            {
-                "store": "eBay",
-                "price": "לחץ לחיפוש",
-                "link": f"https://www.ebay.com/sch/i.html?_nkw={query}&_sop=15",
-                "title": product_name[:60]
-            },
-            {
-                "store": "Amazon",
-                "price": "לחץ לחיפוש",
-                "link": f"https://www.amazon.com/s?k={query}",
-                "title": product_name[:60]
-            },
-        ]
+        return [{
+            "store": "AliExpress",
+            "price": "לחץ לחיפוש",
+            "link": f"https://www.aliexpress.com/wholesale?SearchText={query}&SortType=total_tranpro_desc",
+            "title": f"חפש: {product_name[:60]}"
+        }]
 
     def _sort_by_price(self, prices: list) -> list:
         def extract_number(price_str: str) -> float:
