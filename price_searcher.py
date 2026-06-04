@@ -14,7 +14,7 @@ SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "").strip()
 def _proxied(url: str) -> str:
     if not SCRAPER_API_KEY:
         return url
-    return f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}&url={quote_plus(url)}"
+    return f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}&render=true&country_code=us&url={quote_plus(url)}"
 
 
 HEADERS = {
@@ -154,9 +154,14 @@ class PriceSearcher:
             logger.info(f"Parsed {len(results)} results")
 
             if not results:
-                # Log a snippet to help debug selectors
-                snippet = re.sub(r'\s+', ' ', html[5000:6000])
-                logger.warning(f"No results. HTML snippet: {snippet[:300]}")
+                # Dump key info to help debug
+                keys = ["itemId","productId","salePrice","formattedPrice","runParams",
+                        "window._dida","US $","subject","itemList","skuId"]
+                found = {k: html.count(k) for k in keys if k in html}
+                logger.warning(f"No results. Keywords in HTML: {found}")
+                for i, start in enumerate([0, 3000, 8000]):
+                    chunk = re.sub(r'\\s+', ' ', html[start:start+1500])
+                    logger.warning(f"HTML chunk[{i}]: {chunk}")
                 return self._fallback_links(product_name)
 
             return results[:5]
