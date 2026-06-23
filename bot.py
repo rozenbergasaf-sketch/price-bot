@@ -62,8 +62,8 @@ async def _do_search(loading_msg, product_name: str = None, image_bytes: bytes =
 
         if prices and prices[0].get("price") != "לחץ לחיפוש":
             response += "💰 *5 המחירים הזולים ביותר ב-Amazon:*\n\n"
-            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-            for i, item in enumerate(prices[:5]):
+            medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            for i, item in enumerate(prices[:10]):
                 medal = medals[i] if i < len(medals) else f"{i+1}."
                 price = item.get("price", "?")
                 link = item.get("link", "")
