@@ -68,7 +68,12 @@ class PriceSearcher:
             if not all_prices:
                 return {"success": True, "product_name": product_name, "prices": self._fallback(product_name)}
 
-            return {"success": True, "product_name": product_name, "prices": all_prices[:5]}
+            # Keep up to 5 from USA + up to 5 cheapest from other countries
+            usa_prices = [p for p in all_prices if "USA" in p.get("store", "")][:5]
+            other_prices = [p for p in all_prices if "USA" not in p.get("store", "")][:5]
+            final = usa_prices + other_prices
+            final = sorted(final, key=lambda x: x.get("price_usd", 999999))
+            return {"success": True, "product_name": product_name, "prices": final}
 
         except Exception as e:
             logger.error(f"search_prices error: {e}")
@@ -100,7 +105,8 @@ class PriceSearcher:
             products = data.get("results", [])
             logger.info(f"{site['flag']} {site['name']}: {len(products)} products in JSON")
 
-            for item in products[:3]:
+            max_results = 5 if site["domain"] == "amazon.com" else 2
+            for item in products[:max_results]:
                 price_str = item.get("price", "")
                 if not price_str:
                     continue
