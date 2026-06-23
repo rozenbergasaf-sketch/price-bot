@@ -11,14 +11,14 @@ logger = logging.getLogger(__name__)
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "").strip()
 
 AMAZON_SITES = [
-    {"domain": "amazon.com",    "country": "us", "flag": "🇺🇸", "name": "USA",       "currency": "USD"},
-    {"domain": "amazon.co.uk",  "country": "uk", "flag": "🇬🇧", "name": "UK",        "currency": "GBP"},
-    {"domain": "amazon.de",     "country": "de", "flag": "🇩🇪", "name": "Germany",   "currency": "EUR"},
-    {"domain": "amazon.fr",     "country": "fr", "flag": "🇫🇷", "name": "France",    "currency": "EUR"},
-    {"domain": "amazon.it",     "country": "it", "flag": "🇮🇹", "name": "Italy",     "currency": "EUR"},
-    {"domain": "amazon.es",     "country": "es", "flag": "🇪🇸", "name": "Spain",     "currency": "EUR"},
-    {"domain": "amazon.ca",     "country": "ca", "flag": "🇨🇦", "name": "Canada",    "currency": "CAD"},
-    {"domain": "amazon.co.jp",  "country": "jp", "flag": "🇯🇵", "name": "Japan",     "currency": "JPY"},
+    {"domain": "amazon.com",    "country": "us", "flag": "🇺🇸", "name": "USA",      "currency": "USD"},
+    {"domain": "amazon.co.uk",  "country": "uk", "flag": "🇬🇧", "name": "UK",       "currency": "GBP"},
+    {"domain": "amazon.de",     "country": "de", "flag": "🇩🇪", "name": "Germany",  "currency": "EUR"},
+    {"domain": "amazon.fr",     "country": "fr", "flag": "🇫🇷", "name": "France",   "currency": "EUR"},
+    {"domain": "amazon.it",     "country": "it", "flag": "🇮🇹", "name": "Italy",    "currency": "EUR"},
+    {"domain": "amazon.es",     "country": "es", "flag": "🇪🇸", "name": "Spain",    "currency": "EUR"},
+    {"domain": "amazon.ca",     "country": "ca", "flag": "🇨🇦", "name": "Canada",   "currency": "CAD"},
+    {"domain": "amazon.co.jp",  "country": "jp", "flag": "🇯🇵", "name": "Japan",    "currency": "JPY"},
 ]
 
 TO_USD = {
@@ -26,26 +26,17 @@ TO_USD = {
     "AUD": 0.65, "JPY": 0.0067, "INR": 0.012,
 }
 
-
-def _proxied(url: str, country: str = "us") -> str:
-    if not SCRAPER_API_KEY:
-        return url
-    return (f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}"
-            f"&render=true&country_code={country}&url={quote_plus(url)}")
-
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 
 class PriceSearcher:
     def __init__(self):
         self.timeout = aiohttp.ClientTimeout(total=60)
-        logger.warning("PRICE_SEARCHER_VERSION=v5-debug")
+        logger.warning("PRICE_SEARCHER_VERSION=v6-structured-api")
         if SCRAPER_API_KEY:
             logger.info(f"SCRAPER_API_KEY starts: {SCRAPER_API_KEY[:6]}...")
         else:
@@ -67,11 +58,11 @@ class PriceSearcher:
             results_per_site = await asyncio.gather(*tasks, return_exceptions=True)
 
             all_prices = []
-            for site, result in zip(AMAZON_SITES, results_per_site):
+            for result in results_per_site:
                 if isinstance(result, list):
                     all_prices.extend(result)
 
-            all_prices = self._sort_by_usd(all_prices)
+            all_prices = sorted(all_prices, key=lambda x: x.get("price_usd", 999999))
             logger.info(f"Total results: {len(all_prices)}")
 
             if not all_prices:
@@ -84,165 +75,106 @@ class PriceSearcher:
             return {"success": False, "error": str(e)}
 
     async def _search_one_amazon(self, product_name, site):
+        """Use ScraperAPI structured Amazon search — returns clean JSON."""
         if not SCRAPER_API_KEY:
             return []
         query = quote_plus(product_name)
-        url = f"https://www.{site['domain']}/s?k={query}&s=price-asc-rank&rh=n%3A0&ref=sr_pg_1"
-        fetch_url = _proxied(url, site["country"])
+        # ScraperAPI structured endpoint for Amazon search
+        url = (
+            f"https://api.scraperapi.com/structured/amazon/search"
+            f"?api_key={SCRAPER_API_KEY}"
+            f"&query={query}"
+            f"&country={site['country']}"
+        )
         try:
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
-                async with session.get(fetch_url) as response:
+                async with session.get(url) as response:
+                    logger.info(f"{site['flag']} {site['name']}: status {response.status}")
                     if response.status != 200:
-                        logger.warning(f"{site['name']}: status {response.status}")
+                        body = await response.text()
+                        logger.warning(f"{site['name']} error body: {body[:200]}")
                         return []
-                    html = await response.text()
+                    data = await response.json()
 
-            # DEBUG: always log for USA
-            if site["domain"] == "amazon.com":
-                keys = ["data-asin", "a-price-whole", "a-price-fraction",
-                        "a-offscreen", "s-item-image", "puis-price",
-                        "data-component-type", "data-index", "s-result-item",
-                        "sg-col-inner", "s-search-result", "a-section"]
-                found = {k: html.count(k) for k in keys}
-                logger.warning(f"USA_KEYWORDS={found} html_len={len(html)}")
-                # Show area around first a-offscreen to understand structure
-                pos = html.find("a-offscreen")
-                if pos > 0:
-                    chunk = re.sub(r'\s+', ' ', html[max(0,pos-300):pos+500])
-                    logger.warning(f"OFFSCREEN_CONTEXT={chunk[:600]}")
-                # Show area around first price-whole
-                pos2 = html.find("a-price-whole")
-                if pos2 > 0:
-                    chunk2 = re.sub(r'\s+', ' ', html[max(0,pos2-300):pos2+500])
-                    logger.warning(f"PRICE_WHOLE_CONTEXT={chunk2[:600]}")
+            results = []
+            products = data.get("results", [])
+            logger.info(f"{site['flag']} {site['name']}: {len(products)} products in JSON")
 
-            results = self._parse_amazon_html(html, site)
-            logger.info(f"{site['flag']} {site['name']}: {len(results)} results")
+            for item in products[:3]:
+                price_str = item.get("price", "")
+                if not price_str:
+                    continue
+                # Extract numeric value
+                nums = re.findall(r'[\d]+\.?\d*', str(price_str).replace(",", ""))
+                if not nums:
+                    continue
+                try:
+                    price_usd = float(nums[0]) * TO_USD.get(site["currency"], 1.0)
+                except Exception:
+                    continue
+
+                asin = item.get("asin", "")
+                link = f"https://www.{site['domain']}/dp/{asin}" if asin else item.get("url", "")
+                title = item.get("name", item.get("title", ""))[:80]
+
+                results.append({
+                    "store": f"Amazon {site['flag']} {site['name']}",
+                    "price": f"{site['currency']} {price_str}",
+                    "price_usd": price_usd,
+                    "link": link,
+                    "title": title,
+                })
+
             return results
 
         except Exception as e:
             logger.warning(f"{site['name']} error: {e}")
             return []
 
-    def _parse_amazon_html(self, html, site):
-        results = []
-        seen = set()
-
-        # Try multiple block separators
-        blocks = []
-        for splitter in [
-            r'(?=<div[^>]+data-component-type="s-search-result")',
-            r'(?=<div[^>]+data-index="\d+")',
-            r'(?=<div[^>]+class="[^"]*s-result-item[^"]*")',
-            r'(?=<div[^>]+class="[^"]*dcl-product[^"]*")',
-            r'(?=<li[^>]+class="[^"]*s-result-item[^"]*")',
-        ]:
-            blocks = re.split(splitter, html)
-            if len(blocks) > 3:
-                break
-
-        logger.info(f"{site['name']} blocks={len(blocks)}")
-
-        for block in blocks[1:]:  # skip first (page header)
-            if len(results) >= 3:
-                break
-
-            # Extract ASIN from /dp/ link within this block
-            asin_m = re.search(r'/dp/([A-Z0-9]{10})[^"]', block)
-            if not asin_m:
-                continue
-            asin = asin_m.group(1)
-            if asin in seen:
-                continue
-            seen.add(asin)
-
-            # Extract FIRST a-offscreen price (skip "List Price" / old price)
-            # Look for dcl-product-price-new first, then fallback to any a-offscreen
-            price_m = re.search(
-                r'dcl-product-price-new[^>]*>[^<]*<span class="a-offscreen">([^<]{2,20})</span>',
-                block)
-            if not price_m:
-                price_m = re.search(r'class="a-offscreen">([^<]{2,20})</span>', block)
-            if not price_m:
-                whole_m = re.search(
-                    r'<span class="a-price-whole">([\d\.,]+)</span>[\s\S]{0,200}?'
-                    r'<span class="a-price-fraction">(\d+)</span>', block)
-                if not whole_m:
-                    continue
-                whole_clean = re.sub(r'[^\d]', '', whole_m.group(1))
-                price_str = f"{whole_clean}.{whole_m.group(2)}"
-            else:
-                price_str = price_m.group(1).strip()
-
-            # Extract numeric value for sorting
-            nums = re.findall(r'[\d]+\.?\d*', price_str.replace(",", ""))
-            if not nums:
-                continue
-            try:
-                price_usd = float(nums[0]) * TO_USD.get(site["currency"], 1.0)
-            except Exception:
-                continue
-
-            # Extract title from this block
-            title = ""
-            for pat in [
-                r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{5,150})</span>',
-                r'<h2[^>]*>[\s\S]{0,200}?<span[^>]*>([^<]{5,150})</span>',
-            ]:
-                m = re.search(pat, block)
-                if m:
-                    title = m.group(1).strip()[:80]
-                    break
-
-            # Build clean product link
-            href_m = re.search(r'href="(/[^"]*?/dp/' + asin + r'[^"]*?)"', block)
-            if href_m:
-                link = f"https://www.{site['domain']}{href_m.group(1).split('?')[0]}"
-            else:
-                link = f"https://www.{site['domain']}/dp/{asin}"
-
-            results.append({
-                "store": f"Amazon {site['flag']} {site['name']}",
-                "price": f"{site['currency']} {price_str}",
-                "price_usd": price_usd,
-                "link": link,
-                "title": title,
-            })
-
-        return results
-
-    def _find_title(self, html, asin):
-        pos = html.find(f'data-asin="{asin}"')
-        if pos < 0:
-            return ""
-        block = html[pos:pos + 2000]
-        for pat in [
-            r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{5,150})</span>',
-            r'<h2[^>]*>[\s\S]*?<span[^>]*>([^<]{5,150})</span>',
-        ]:
-            m = re.search(pat, block)
-            if m:
-                return m.group(1).strip()[:80]
-        return ""
-
     async def _extract_from_url(self, url):
         try:
             domain = urlparse(url).netloc.lower()
             site = next((s for s in AMAZON_SITES if s["domain"] in domain), {"country": "us"})
-            fetch_url = _proxied(url, site["country"])
+            # Use ScraperAPI structured product endpoint
+            api_url = (
+                f"https://api.scraperapi.com/structured/amazon/product"
+                f"?api_key={SCRAPER_API_KEY}"
+                f"&asin={self._extract_asin(url)}"
+                f"&country={site['country']}"
+            )
+            asin = self._extract_asin(url)
+            if asin and SCRAPER_API_KEY:
+                async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
+                    async with session.get(api_url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            name = data.get("name", data.get("title", ""))
+                            if name:
+                                return {"success": True, "name": name}
+
+            # Fallback: scrape page directly
+            proxied = (f"https://api.scraperapi.com/?api_key={SCRAPER_API_KEY}"
+                      f"&render=true&country_code={site.get('country','us')}&url={quote_plus(url)}")
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
-                async with session.get(fetch_url, allow_redirects=True) as response:
+                async with session.get(proxied, allow_redirects=True) as response:
                     if response.status != 200:
                         return {"success": False, "error": f"שגיאה {response.status}"}
                     html = await response.text()
-            name = self._extract_name(html, url)
+
+            name = self._extract_name(html)
             if not name:
                 return {"success": False, "error": "לא נמצא שם מוצר — שלח שם ישירות"}
             return {"success": True, "name": name}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
 
-    def _extract_name(self, html, url):
+        except Exception as e:
+            logger.error(f"_extract_from_url: {e}")
+            return {"success": False, "error": "לא ניתן לגשת לדף."}
+
+    def _extract_asin(self, url):
+        m = re.search(r'/dp/([A-Z0-9]{10})', url)
+        return m.group(1) if m else ""
+
+    def _extract_name(self, html):
         for pat in [
             r'id="productTitle"[^>]*>\s*([^<]{10,300})',
             r'"title"\s*:\s*"([^"]{10,300})"',
@@ -266,8 +198,5 @@ class PriceSearcher:
     def _fallback(self, product_name):
         query = quote_plus(product_name)
         return [{"store": "Amazon 🌍", "price": "לחץ לחיפוש",
-                 "link": f"https://www.amazon.com/s?k={query}&s=price-asc-rank",
-                 "title": product_name[:60]}]
-
-    def _sort_by_usd(self, prices):
-        return sorted(prices, key=lambda x: x.get("price_usd", 999999))
+                 "link": f"https://www.amazon.com/s?k={query}",
+                 "title": product_name[:60], "price_usd": 999999}]
