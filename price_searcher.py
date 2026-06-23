@@ -87,7 +87,7 @@ class PriceSearcher:
         if not SCRAPER_API_KEY:
             return []
         query = quote_plus(product_name)
-        url = f"https://www.{site['domain']}/s?k={query}&s=price-asc-rank"
+        url = f"https://www.{site['domain']}/s?k={query}&s=price-asc-rank&rh=n%3A0&ref=sr_pg_1"
         fetch_url = _proxied(url, site["country"])
         try:
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
@@ -125,23 +125,21 @@ class PriceSearcher:
             return []
 
     def _parse_amazon_html(self, html, site):
-        """
-        Parse Amazon search results by splitting into per-product blocks.
-        Each block starts with data-component-type="s-search-result" or similar.
-        Within each block we extract: ASIN (from /dp/), price (a-offscreen), title.
-        """
         results = []
         seen = set()
 
-        # Split HTML into individual product result blocks
-        # Amazon wraps each result in a div with data-index or s-search-result
-        blocks = re.split(
+        # Try multiple block separators
+        blocks = []
+        for splitter in [
             r'(?=<div[^>]+data-component-type="s-search-result")',
-            html
-        )
-        if len(blocks) < 3:
-            # Fallback split by data-index
-            blocks = re.split(r'(?=<div[^>]+data-index="\d+")', html)
+            r'(?=<div[^>]+data-index="\d+")',
+            r'(?=<div[^>]+class="[^"]*s-result-item[^"]*")',
+            r'(?=<div[^>]+class="[^"]*dcl-product[^"]*")',
+            r'(?=<li[^>]+class="[^"]*s-result-item[^"]*")',
+        ]:
+            blocks = re.split(splitter, html)
+            if len(blocks) > 3:
+                break
 
         logger.info(f"{site['name']} blocks={len(blocks)}")
 
@@ -158,10 +156,14 @@ class PriceSearcher:
                 continue
             seen.add(asin)
 
-            # Extract FIRST a-offscreen price in this block (= the main price)
-            price_m = re.search(r'class="a-offscreen">([^<]{2,20})</span>', block)
+            # Extract FIRST a-offscreen price (skip "List Price" / old price)
+            # Look for dcl-product-price-new first, then fallback to any a-offscreen
+            price_m = re.search(
+                r'dcl-product-price-new[^>]*>[^<]*<span class="a-offscreen">([^<]{2,20})</span>',
+                block)
             if not price_m:
-                # Try a-price-whole
+                price_m = re.search(r'class="a-offscreen">([^<]{2,20})</span>', block)
+            if not price_m:
                 whole_m = re.search(
                     r'<span class="a-price-whole">([\d\.,]+)</span>[\s\S]{0,200}?'
                     r'<span class="a-price-fraction">(\d+)</span>', block)
