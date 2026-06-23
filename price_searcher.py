@@ -116,30 +116,51 @@ class PriceSearcher:
 
     def _parse_amazon_html(self, html, site):
         results = []
-        seen = set()
+        seen_links = set()
 
-        # Strategy 1: data-asin + a-price-whole
-        blocks = re.findall(
-            r'data-asin="([A-Z0-9]{10})"[\s\S]{0,3000}?'
-            r'<span class="a-price-whole">([\d\.,]+)</span>'
-            r'[\s\S]{0,300}?<span class="a-price-fraction">(\d+)</span>',
-            html
-        )
-        for asin, whole, frac in blocks:
-            if not asin or asin in seen:
+        # Strategy 1: a-offscreen prices + /dp/ASIN links (works with new Amazon layout)
+        # Extract all prices from a-offscreen spans
+        prices_raw = re.findall(r'class="a-offscreen">([^<]{2,20})</span>', html)
+        # Extract all product links /dp/ASIN
+        dp_links = list(dict.fromkeys(re.findall(r'href="(/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)))
+
+        logger.info(f"{site['name']} S1: {len(prices_raw)} prices, {len(dp_links)} dp_links")
+
+        for i, (href, asin) in enumerate(dp_links[:5]):
+            if asin in seen_links:
                 continue
-            seen.add(asin)
-            whole_clean = re.sub(r'[^\d]', '', whole)
-            if not whole_clean:
+            seen_links.add(asin)
+            # Get price — skip first (often header/nav prices), take matching index
+            price_str = prices_raw[i] if i < len(prices_raw) else ""
+            if not price_str:
                 continue
-            price_str = f"{site['currency']} {whole_clean}.{frac}"
-            price_usd = int(whole_clean) * TO_USD.get(site["currency"], 1.0)
-            title = self._find_title(html, asin)
+            nums = re.findall(r'[\d,]+\.?\d*', price_str.replace(",", ""))
+            if not nums:
+                continue
+            try:
+                price_usd = float(nums[0]) * TO_USD.get(site["currency"], 1.0)
+            except Exception:
+                continue
+            # Find title near this href
+            pos = html.find(href)
+            title = ""
+            if pos >= 0:
+                block = html[max(0, pos-500):pos+1000]
+                for pat in [
+                    r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{5,150})</span>',
+                    r'<h2[^>]*>[\s\S]*?<span[^>]*>([^<]{5,150})</span>',
+                ]:
+                    m = re.search(pat, block)
+                    if m:
+                        title = m.group(1).strip()[:80]
+                        break
+
+            full_link = f"https://www.{site['domain']}{href.split('?')[0]}"
             results.append({
                 "store": f"Amazon {site['flag']} {site['name']}",
-                "price": price_str,
+                "price": f"{site['currency']} {price_str}",
                 "price_usd": price_usd,
-                "link": f"https://www.{site['domain']}/dp/{asin}",
+                "link": full_link,
                 "title": title,
             })
             if len(results) >= 3:
@@ -148,50 +169,35 @@ class PriceSearcher:
         if results:
             return results
 
-        # Strategy 2: a-offscreen price (Amazon sometimes uses this)
-        offscreen = re.findall(r'class="a-offscreen">([^<]{2,20})</span>', html)
-        asins = list(dict.fromkeys(re.findall(r'data-asin="([A-Z0-9]{10})"', html)))
-
-        if asins and offscreen:
-            logger.info(f"{site['name']} Strategy2: {len(asins)} asins, {len(offscreen)} prices")
-            for i, asin in enumerate(asins[:3]):
-                if asin in seen:
+        # Strategy 2: a-price-whole (old layout fallback)
+        whole_prices = re.findall(
+            r'<span class="a-price-whole">([\d\.,]+)</span>[\s\S]{0,200}?'
+            r'<span class="a-price-fraction">(\d+)</span>',
+            html
+        )
+        for i, (whole, frac) in enumerate(whole_prices[:3]):
+            whole_clean = re.sub(r'[^\d]', '', whole)
+            if not whole_clean:
+                continue
+            # Pair with a dp link
+            link = ""
+            if i < len(dp_links):
+                href, asin = dp_links[i]
+                link = f"https://www.{site['domain']}{href.split('?')[0]}"
+                if asin in seen_links:
                     continue
-                seen.add(asin)
-                price_str = offscreen[i] if i < len(offscreen) else "N/A"
-                # Extract numeric value
-                nums = re.findall(r'[\d,]+\.?\d*', price_str)
-                price_usd = float(nums[0].replace(',', '')) * TO_USD.get(site["currency"], 1.0) if nums else 999999
-                results.append({
-                    "store": f"Amazon {site['flag']} {site['name']}",
-                    "price": f"{site['currency']} {price_str}",
-                    "price_usd": price_usd,
-                    "link": f"https://www.{site['domain']}/dp/{asin}",
-                    "title": self._find_title(html, asin),
-                })
-            return results
+                seen_links.add(asin)
 
-        # Strategy 3: pure regex price + asin
-        prices_raw = re.findall(r'(?:\$|£|€|¥)\s*([\d,]+\.?\d*)', html)
-        if asins and prices_raw:
-            logger.info(f"{site['name']} Strategy3: {len(asins)} asins, {len(prices_raw)} prices")
-            for i, asin in enumerate(asins[:3]):
-                if asin in seen:
-                    continue
-                seen.add(asin)
-                p = prices_raw[i] if i < len(prices_raw) else "?"
-                nums = re.findall(r'[\d]+\.?\d*', p.replace(',', ''))
-                price_usd = float(nums[0]) * TO_USD.get(site["currency"], 1.0) if nums else 999999
-                results.append({
-                    "store": f"Amazon {site['flag']} {site['name']}",
-                    "price": f"{site['currency']} {p}",
-                    "price_usd": price_usd,
-                    "link": f"https://www.{site['domain']}/dp/{asin}",
-                    "title": "",
-                })
-            return results
+            price_usd = int(whole_clean) * TO_USD.get(site["currency"], 1.0)
+            results.append({
+                "store": f"Amazon {site['flag']} {site['name']}",
+                "price": f"{site['currency']} {whole_clean}.{frac}",
+                "price_usd": price_usd,
+                "link": link,
+                "title": "",
+            })
 
-        return []
+        return results
 
     def _find_title(self, html, asin):
         pos = html.find(f'data-asin="{asin}"')
