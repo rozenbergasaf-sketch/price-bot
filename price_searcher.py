@@ -27,7 +27,7 @@ HEADERS = {
 
 class PriceSearcher:
     def __init__(self):
-        self.timeout = aiohttp.ClientTimeout(total=45)
+        self.timeout = aiohttp.ClientTimeout(total=60)
         if SCRAPER_API_KEY:
             logger.info(f"✅ SCRAPER_API_KEY loaded (starts: {SCRAPER_API_KEY[:6]}...)")
         else:
@@ -44,8 +44,8 @@ class PriceSearcher:
             if not product_name:
                 return {"success": False, "error": "לא סופק מוצר לחיפוש"}
 
-            logger.info(f"Searching AliExpress for: '{product_name}'")
-            prices = await self._search_aliexpress(product_name)
+            logger.info(f"Searching Amazon for: '{product_name}'")
+            prices = await self._search_amazon(product_name)
             prices = self._sort_by_price(prices)
             logger.info(f"Found {len(prices)} results")
 
@@ -54,17 +54,10 @@ class PriceSearcher:
             logger.error(f"search_prices error: {e}")
             return {"success": False, "error": f"שגיאה: {str(e)}"}
 
-    # ------------------------------------------------------------------ #
-    #  Extract product name from URL                                      #
-    # ------------------------------------------------------------------ #
     async def _extract_from_url(self, url: str) -> dict:
-        # Force English version of AliExpress for better parsing
-        en_url = re.sub(r'https?://(he|fr|de|es|ru|pt)\.aliexpress', 'https://www.aliexpress', url)
-        en_url = re.sub(r'\?.*', '', en_url)  # strip query params that cause redirects
-
         try:
-            fetch_url = _proxied(en_url)
-            logger.info(f"Fetching: {en_url[:80]}")
+            fetch_url = _proxied(url)
+            logger.info(f"Fetching: {url[:80]}")
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
                 async with session.get(fetch_url, allow_redirects=True) as response:
                     logger.info(f"Page status: {response.status}")
@@ -72,9 +65,9 @@ class PriceSearcher:
                         return {"success": False, "error": f"לא ניתן לגשת לדף (קוד {response.status})"}
                     html = await response.text()
 
-            name = self._extract_name_from_html(html, en_url)
-            logger.info(f"Extracted name: '{name[:60]}'")
-            if not name or name.lower() in ("aliexpress", "alibaba"):
+            name = self._extract_name_from_html(html, url)
+            logger.info(f"Extracted name: '{name[:80]}'")
+            if not name:
                 return {"success": False, "error": "לא הצלחתי לחלץ את שם המוצר — נסה לשלוח את שם המוצר ישירות"}
             return {"success": True, "name": name}
 
@@ -85,9 +78,17 @@ class PriceSearcher:
             return {"success": False, "error": "לא ניתן לגשת לדף."}
 
     def _extract_name_from_html(self, html: str, url: str) -> str:
-        """Extract product name — try JSON-LD and meta tags first, avoid og:title on AliExpress."""
+        domain = urlparse(url).netloc.lower()
 
-        # 1. JSON-LD Product schema (most reliable)
+        if "amazon" in domain:
+            for pattern in [
+                r'id="productTitle"[^>]*>\s*([^<]{10,300})',
+                r'"title"\s*:\s*"([^"]{10,300})"',
+            ]:
+                m = re.search(pattern, html)
+                if m:
+                    return m.group(1).strip()
+
         for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>([\s\S]*?)</script>', html, re.I):
             try:
                 data = json.loads(m.group(1))
@@ -100,178 +101,104 @@ class PriceSearcher:
             except Exception:
                 pass
 
-        # 2. AliExpress specific: window.runParams or _dida_config_ JSON
-        for pattern in [
-            r'"subject"\s*:\s*"([^"]{10,200})"',
-            r'"title"\s*:\s*"([^"]{10,200})"',
-            r'"productTitle"\s*:\s*"([^"]{10,200})"',
-            r'"name"\s*:\s*"([^"]{10,200})"',
-        ]:
-            m = re.search(pattern, html)
-            if m:
-                candidate = m.group(1)
-                # Skip if it looks like a site name or URL
-                if not any(skip in candidate.lower() for skip in ["aliexpress", "alibaba", "http", "{"]):
-                    return candidate[:200]
-
-        # 3. og:title — but skip AliExpress generic titles
-        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{10,300})["\']', html, re.I)
         if m:
             t = m.group(1).strip()
-            if len(t) > 10 and "aliexpress" not in t.lower() and "alibaba" not in t.lower():
+            if not any(s in t.lower() for s in ["amazon.com", "aliexpress"]):
                 return self._clean(t)
 
-        # 4. <title> tag
-        m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.I)
+        m = re.search(r'<title[^>]*>([^<]{10,300})</title>', html, re.I)
         if m:
-            t = m.group(1).strip()
-            if "aliexpress" not in t.lower():
-                return self._clean(t)
+            return self._clean(m.group(1).strip())
 
         return ""
 
-    # ------------------------------------------------------------------ #
-    #  Search AliExpress — parse embedded JSON from page                 #
-    # ------------------------------------------------------------------ #
-    async def _search_aliexpress(self, product_name: str) -> list:
+    async def _search_amazon(self, product_name: str) -> list:
         if not SCRAPER_API_KEY:
             return self._fallback_links(product_name)
 
         query = quote_plus(product_name)
-        ali_url = f"https://www.aliexpress.com/wholesale?SearchText={query}&SortType=total_tranpro_desc&page=1"
-        fetch_url = _proxied(ali_url)
+        amazon_url = f"https://www.amazon.com/s?k={query}&s=price-asc-rank"
+        fetch_url = _proxied(amazon_url)
 
         try:
             async with aiohttp.ClientSession(headers=HEADERS, timeout=self.timeout) as session:
                 async with session.get(fetch_url) as response:
-                    logger.info(f"AliExpress search status: {response.status}")
+                    logger.info(f"Amazon search status: {response.status}")
                     if response.status != 200:
                         return self._fallback_links(product_name)
                     html = await response.text()
 
-            logger.info(f"HTML length={len(html)}")
-            results = self._parse_aliexpress_html(html)
+            logger.info(f"HTML length={len(html)}, has 'a-price-whole': {'a-price-whole' in html}, has 'data-asin': {'data-asin' in html}")
+            results = self._parse_amazon_html(html)
             logger.info(f"Parsed {len(results)} results")
 
             if not results:
-                # Dump key info to help debug
-                keys = ["itemId","productId","salePrice","formattedPrice","runParams",
-                        "window._dida","US $","subject","itemList","skuId"]
+                keys = ["data-asin", "a-price-whole", "a-price-fraction", "a-offscreen", "priceblock"]
                 found = {k: html.count(k) for k in keys if k in html}
-                logger.warning(f"No results. Keywords in HTML: {found}")
-                for i, start in enumerate([0, 3000, 8000]):
-                    chunk = re.sub(r'\\s+', ' ', html[start:start+1500])
-                    logger.warning(f"HTML chunk[{i}]: {chunk}")
+                logger.warning(f"No results. Keywords: {found}")
+                chunk = re.sub(r'\s+', ' ', html[3000:5000])
+                logger.warning(f"HTML sample: {chunk[:600]}")
                 return self._fallback_links(product_name)
 
             return results[:5]
 
         except Exception as e:
-            logger.error(f"_search_aliexpress: {e}")
+            logger.error(f"_search_amazon: {e}")
             return self._fallback_links(product_name)
 
-    def _parse_aliexpress_html(self, html: str) -> list:
+    def _parse_amazon_html(self, html: str) -> list:
         results = []
 
-        # ---- Strategy 1: window.runParams JSON (AliExpress search page) ----
-        for pattern in [
-            r'window\.runParams\s*=\s*(\{[\s\S]*?\});\s*(?:var|window|//)',
-            r'"mods"\s*:\s*\{[\s\S]*?"itemList"\s*:\s*\{[\s\S]*?"content"\s*:\s*(\[[\s\S]*?\])\s*[,\}]',
-            r'"productList"\s*:\s*(\[[\s\S]*?\])\s*[,\}]',
-            r'"items"\s*:\s*(\[[\s\S]{100,50000}?\])\s*[,\}]',
-        ]:
-            m = re.search(pattern, html)
-            if not m:
+        # Strategy 1: data-asin blocks with price
+        asin_blocks = re.findall(
+            r'data-asin="([A-Z0-9]{10})"[\s\S]{0,3000}?'
+            r'<span class="a-price-whole">([\d,]+)</span>'
+            r'[\s\S]{0,200}?<span class="a-price-fraction">(\d+)</span>',
+            html
+        )
+
+        seen = set()
+        for asin, whole, fraction in asin_blocks:
+            if not asin or asin in seen:
                 continue
-            try:
-                raw = m.group(1)
-                # If it's a full object, dig into it
-                data = json.loads(raw)
-                items = []
-                if isinstance(data, list):
-                    items = data
-                elif isinstance(data, dict):
-                    # Walk common paths
-                    items = (data.get("mods", {}).get("itemList", {}).get("content") or
-                             data.get("data", {}).get("itemList", {}).get("content") or
-                             data.get("items") or [])
+            seen.add(asin)
+            price = f"${whole.replace(',', '')}.{fraction}"
+            link = f"https://www.amazon.com/dp/{asin}"
 
-                for item in items[:5]:
-                    if not isinstance(item, dict):
-                        continue
-                    item_id = str(item.get("itemId") or item.get("productId") or "")
-                    title = item.get("title") or item.get("name") or item.get("subject") or ""
-                    if isinstance(title, dict):
-                        title = title.get("displayTitle") or title.get("seoTitle") or ""
+            title = ""
+            asin_pos = html.find(f'data-asin="{asin}"')
+            if asin_pos >= 0:
+                block = html[asin_pos:asin_pos + 2000]
+                t = re.search(r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{5,150})</span>', block)
+                if not t:
+                    t = re.search(r'<h2[^>]*>[\s\S]*?<span[^>]*>([^<]{5,150})</span>', block)
+                if t:
+                    title = t.group(1).strip()
 
-                    # Price — try multiple paths
-                    price = ""
-                    for path in [
-                        lambda x: x.get("salePrice"),
-                        lambda x: x.get("prices", {}).get("salePrice", {}).get("formattedPrice"),
-                        lambda x: x.get("prices", {}).get("originalPrice", {}).get("formattedPrice"),
-                        lambda x: x.get("price", {}).get("formattedPrice") if isinstance(x.get("price"), dict) else x.get("price"),
-                    ]:
-                        try:
-                            v = path(item)
-                            if v and re.search(r'\d', str(v)):
-                                price = str(v)
-                                break
-                        except Exception:
-                            pass
-
-                    if item_id and price:
-                        results.append({
-                            "store": "AliExpress",
-                            "price": price,
-                            "link": f"https://www.aliexpress.com/item/{item_id}.html",
-                            "title": str(title)[:80],
-                        })
-                if results:
-                    logger.info(f"Strategy 1 (JSON) found {len(results)} items")
-                    return results
-            except Exception as je:
-                logger.debug(f"JSON parse attempt failed: {je}")
-
-        # ---- Strategy 2: regex over raw HTML for item IDs + prices ----
-        item_ids = re.findall(r'/item/(\d{10,20})\.html', html)
-        prices_raw = re.findall(r'(?:US\s*\$|€|£)\s*([\d,]+\.?\d*)', html)
-
-        seen = []
-        for item_id in dict.fromkeys(item_ids):  # unique, preserve order
-            if len(seen) >= 5:
+            results.append({"store": "Amazon", "price": price, "link": link, "title": title[:80]})
+            if len(results) >= 5:
                 break
-            seen.append(item_id)
 
-        price_list = []
-        for p in prices_raw:
-            v = p.replace(",", "")
-            try:
-                if 0.5 < float(v) < 10000:
-                    price_list.append(f"US ${v}")
-            except Exception:
-                pass
-
-        if seen:
-            logger.info(f"Strategy 2 (regex) found {len(seen)} item IDs, {len(price_list)} prices")
-            for i, item_id in enumerate(seen):
-                price = price_list[i] if i < len(price_list) else "מחיר לא זמין"
-                results.append({
-                    "store": "AliExpress",
-                    "price": price,
-                    "link": f"https://www.aliexpress.com/item/{item_id}.html",
-                    "title": "",
-                })
+        if results:
+            logger.info(f"Strategy 1 found {len(results)} items")
             return results
 
-        return []
+        # Strategy 2: any ASIN + nearby price
+        asins = list(dict.fromkeys(re.findall(r'data-asin="([A-Z0-9]{10})"', html)))[:5]
+        prices = re.findall(r'\$\s*(\d[\d,]*\.\d{2})', html)
 
-    # ------------------------------------------------------------------ #
-    #  Helpers                                                            #
-    # ------------------------------------------------------------------ #
+        if asins:
+            logger.info(f"Strategy 2: {len(asins)} ASINs, {len(prices)} prices")
+            for i, asin in enumerate(asins):
+                price = f"${prices[i]}" if i < len(prices) else "מחיר לא זמין"
+                results.append({"store": "Amazon", "price": price, "link": f"https://www.amazon.com/dp/{asin}", "title": ""})
+
+        return results
+
     def _clean(self, name: str) -> str:
         for p in [
-            r"\s*[\|\-–]\s*(Amazon|eBay|AliExpress|Walmart|Target|Etsy).*$",
+            r"\s*[\|\-–]\s*(Amazon|eBay|AliExpress|Walmart).*$",
             r"\s*[\|\-–]\s*[A-Z][a-zA-Z\s]*\.com.*$",
         ]:
             name = re.sub(p, "", name, flags=re.IGNORECASE)
@@ -279,12 +206,9 @@ class PriceSearcher:
 
     def _fallback_links(self, product_name: str) -> list:
         query = quote_plus(product_name)
-        return [{
-            "store": "AliExpress",
-            "price": "לחץ לחיפוש",
-            "link": f"https://www.aliexpress.com/wholesale?SearchText={query}&SortType=total_tranpro_desc",
-            "title": f"חפש: {product_name[:60]}"
-        }]
+        return [{"store": "Amazon", "price": "לחץ לחיפוש",
+                 "link": f"https://www.amazon.com/s?k={query}&s=price-asc-rank",
+                 "title": f"חפש: {product_name[:60]}"}]
 
     def _sort_by_price(self, prices: list) -> list:
         def to_num(p: str) -> float:
