@@ -100,11 +100,21 @@ class PriceSearcher:
             # DEBUG: always log for USA
             if site["domain"] == "amazon.com":
                 keys = ["data-asin", "a-price-whole", "a-price-fraction",
-                        "a-offscreen", "s-item-image", "puis-price"]
+                        "a-offscreen", "s-item-image", "puis-price",
+                        "data-component-type", "data-index", "s-result-item",
+                        "sg-col-inner", "s-search-result", "a-section"]
                 found = {k: html.count(k) for k in keys}
                 logger.warning(f"USA_KEYWORDS={found} html_len={len(html)}")
-                clean = re.sub(r'\s+', ' ', html[2000:4000])
-                logger.warning(f"USA_HTML_CHUNK={clean[:800]}")
+                # Show area around first a-offscreen to understand structure
+                pos = html.find("a-offscreen")
+                if pos > 0:
+                    chunk = re.sub(r'\s+', ' ', html[max(0,pos-300):pos+500])
+                    logger.warning(f"OFFSCREEN_CONTEXT={chunk[:600]}")
+                # Show area around first price-whole
+                pos2 = html.find("a-price-whole")
+                if pos2 > 0:
+                    chunk2 = re.sub(r'\s+', ' ', html[max(0,pos2-300):pos2+500])
+                    logger.warning(f"PRICE_WHOLE_CONTEXT={chunk2[:600]}")
 
             results = self._parse_amazon_html(html, site)
             logger.info(f"{site['flag']} {site['name']}: {len(results)} results")
