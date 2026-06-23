@@ -115,86 +115,86 @@ class PriceSearcher:
             return []
 
     def _parse_amazon_html(self, html, site):
+        """
+        Parse Amazon search results by splitting into per-product blocks.
+        Each block starts with data-component-type="s-search-result" or similar.
+        Within each block we extract: ASIN (from /dp/), price (a-offscreen), title.
+        """
         results = []
-        seen_links = set()
+        seen = set()
 
-        # Strategy 1: a-offscreen prices + /dp/ASIN links (works with new Amazon layout)
-        # Extract all prices from a-offscreen spans
-        prices_raw = re.findall(r'class="a-offscreen">([^<]{2,20})</span>', html)
-        # Extract all product links /dp/ASIN
-        dp_links = list(dict.fromkeys(re.findall(r'href="(/[^"]*?/dp/([A-Z0-9]{10})[^"]*?)"', html)))
+        # Split HTML into individual product result blocks
+        # Amazon wraps each result in a div with data-index or s-search-result
+        blocks = re.split(
+            r'(?=<div[^>]+data-component-type="s-search-result")',
+            html
+        )
+        if len(blocks) < 3:
+            # Fallback split by data-index
+            blocks = re.split(r'(?=<div[^>]+data-index="\d+")', html)
 
-        logger.info(f"{site['name']} S1: {len(prices_raw)} prices, {len(dp_links)} dp_links")
+        logger.info(f"{site['name']} blocks={len(blocks)}")
 
-        for i, (href, asin) in enumerate(dp_links[:5]):
-            if asin in seen_links:
+        for block in blocks[1:]:  # skip first (page header)
+            if len(results) >= 3:
+                break
+
+            # Extract ASIN from /dp/ link within this block
+            asin_m = re.search(r'/dp/([A-Z0-9]{10})[^"]', block)
+            if not asin_m:
                 continue
-            seen_links.add(asin)
-            # Get price — skip first (often header/nav prices), take matching index
-            price_str = prices_raw[i] if i < len(prices_raw) else ""
-            if not price_str:
+            asin = asin_m.group(1)
+            if asin in seen:
                 continue
-            nums = re.findall(r'[\d,]+\.?\d*', price_str.replace(",", ""))
+            seen.add(asin)
+
+            # Extract FIRST a-offscreen price in this block (= the main price)
+            price_m = re.search(r'class="a-offscreen">([^<]{2,20})</span>', block)
+            if not price_m:
+                # Try a-price-whole
+                whole_m = re.search(
+                    r'<span class="a-price-whole">([\d\.,]+)</span>[\s\S]{0,200}?'
+                    r'<span class="a-price-fraction">(\d+)</span>', block)
+                if not whole_m:
+                    continue
+                whole_clean = re.sub(r'[^\d]', '', whole_m.group(1))
+                price_str = f"{whole_clean}.{whole_m.group(2)}"
+            else:
+                price_str = price_m.group(1).strip()
+
+            # Extract numeric value for sorting
+            nums = re.findall(r'[\d]+\.?\d*', price_str.replace(",", ""))
             if not nums:
                 continue
             try:
                 price_usd = float(nums[0]) * TO_USD.get(site["currency"], 1.0)
             except Exception:
                 continue
-            # Find title near this href
-            pos = html.find(href)
-            title = ""
-            if pos >= 0:
-                block = html[max(0, pos-500):pos+1000]
-                for pat in [
-                    r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{5,150})</span>',
-                    r'<h2[^>]*>[\s\S]*?<span[^>]*>([^<]{5,150})</span>',
-                ]:
-                    m = re.search(pat, block)
-                    if m:
-                        title = m.group(1).strip()[:80]
-                        break
 
-            full_link = f"https://www.{site['domain']}{href.split('?')[0]}"
+            # Extract title from this block
+            title = ""
+            for pat in [
+                r'<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{5,150})</span>',
+                r'<h2[^>]*>[\s\S]{0,200}?<span[^>]*>([^<]{5,150})</span>',
+            ]:
+                m = re.search(pat, block)
+                if m:
+                    title = m.group(1).strip()[:80]
+                    break
+
+            # Build clean product link
+            href_m = re.search(r'href="(/[^"]*?/dp/' + asin + r'[^"]*?)"', block)
+            if href_m:
+                link = f"https://www.{site['domain']}{href_m.group(1).split('?')[0]}"
+            else:
+                link = f"https://www.{site['domain']}/dp/{asin}"
+
             results.append({
                 "store": f"Amazon {site['flag']} {site['name']}",
                 "price": f"{site['currency']} {price_str}",
                 "price_usd": price_usd,
-                "link": full_link,
-                "title": title,
-            })
-            if len(results) >= 3:
-                break
-
-        if results:
-            return results
-
-        # Strategy 2: a-price-whole (old layout fallback)
-        whole_prices = re.findall(
-            r'<span class="a-price-whole">([\d\.,]+)</span>[\s\S]{0,200}?'
-            r'<span class="a-price-fraction">(\d+)</span>',
-            html
-        )
-        for i, (whole, frac) in enumerate(whole_prices[:3]):
-            whole_clean = re.sub(r'[^\d]', '', whole)
-            if not whole_clean:
-                continue
-            # Pair with a dp link
-            link = ""
-            if i < len(dp_links):
-                href, asin = dp_links[i]
-                link = f"https://www.{site['domain']}{href.split('?')[0]}"
-                if asin in seen_links:
-                    continue
-                seen_links.add(asin)
-
-            price_usd = int(whole_clean) * TO_USD.get(site["currency"], 1.0)
-            results.append({
-                "store": f"Amazon {site['flag']} {site['name']}",
-                "price": f"{site['currency']} {whole_clean}.{frac}",
-                "price_usd": price_usd,
                 "link": link,
-                "title": "",
+                "title": title,
             })
 
         return results
